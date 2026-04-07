@@ -1,0 +1,12 @@
+*.gem
+*.o
+*.so
+*.bundle
+*.dll
+Makefile
+mkmf.log
+ext/mini_embed/Makefile
+lib/mini_embed/*.so
+lib/mini_embed/*.bundle
+.DS_Store
+tmp
