@@ -13,6 +13,8 @@
 #define HASH_SIZE  131071
 #define MAX_DIMS   4
 #define GGUF_ALIGN 32
+#define MAX_MERGES 10000
+#define MAX_REGEX 256
 
 enum ggml_type {
     GGML_TYPE_F32  = 0,
@@ -30,6 +32,370 @@ enum ggml_type {
     GGML_TYPE_Q6_K = 14,
     GGML_TYPE_Q8_K = 15,
 };
+
+enum llama_vocab_type {
+    LLAMA_VOCAB_TYPE_NONE = 0,
+    LLAMA_VOCAB_TYPE_SPM  = 1,
+    LLAMA_VOCAB_TYPE_BPE  = 2,
+    LLAMA_VOCAB_TYPE_WPM  = 3,
+};
+
+/* ------------------------------------------------------------------------- */
+// Unicode helper functions (adapted from llama.cpp)
+static int unicode_len_utf8(char c) {
+    if ((c & 0x80) == 0) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1; // fallback
+}
+
+static int unicode_is_letter(uint32_t cp) {
+    // Basic Unicode letter detection (simplified)
+    return (cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) ||
+           (cp >= 0xC0 && cp <= 0xD6) || (cp >= 0xD8 && cp <= 0xF6) ||
+           (cp >= 0xF8 && cp <= 0x2FF) || (cp >= 0x370 && cp <= 0x37D) ||
+           (cp >= 0x37F && cp <= 0x1FFF) || (cp >= 0x200C && cp <= 0x200D) ||
+           (cp >= 0x2070 && cp <= 0x218F) || (cp >= 0x2C00 && cp <= 0x2FEF) ||
+           (cp >= 0x3001 && cp <= 0xD7FF) || (cp >= 0xF900 && cp <= 0xFDCF) ||
+           (cp >= 0xFDF0 && cp <= 0xFFFD);
+}
+
+static int unicode_is_number(uint32_t cp) {
+    return (cp >= 0x30 && cp <= 0x39) || (cp >= 0x660 && cp <= 0x669) ||
+           (cp >= 0x6F0 && cp <= 0x6F9) || (cp >= 0x7C0 && cp <= 0x7C9) ||
+           (cp >= 0x966 && cp <= 0x96F);
+}
+
+static uint32_t unicode_cpt_from_utf8(const char *s, size_t *len) {
+    uint32_t cp = 0;
+    unsigned char c = (unsigned char)s[0];
+    
+    if (c < 0x80) {
+        *len = 1;
+        return c;
+    } else if ((c & 0xE0) == 0xC0) {
+        *len = 2;
+        cp = (c & 0x1F) << 6;
+        cp |= (s[1] & 0x3F);
+        return cp;
+    } else if ((c & 0xF0) == 0xE0) {
+        *len = 3;
+        cp = (c & 0x0F) << 12;
+        cp |= (s[1] & 0x3F) << 6;
+        cp |= (s[2] & 0x3F);
+        return cp;
+    } else if ((c & 0xF8) == 0xF0) {
+        *len = 4;
+        cp = (c & 0x07) << 18;
+        cp |= (s[1] & 0x3F) << 12;
+        cp |= (s[2] & 0x3F) << 6;
+        cp |= (s[3] & 0x3F);
+        return cp;
+    }
+    
+    *len = 1;
+    return c;
+}
+
+/* ------------------------------------------------------------------------- */
+// Simple regex pattern matcher for pre-tokenization
+typedef struct {
+    char *pattern;
+    int pattern_len;
+} RegexPattern;
+
+static int match_regex(const char *text, const RegexPattern *patterns, int num_patterns) {
+    // Simplified implementation for common BPE patterns
+    // Full regex engine would be complex; this handles the most common cases
+    
+    for (int i = 0; i < num_patterns; i++) {
+        const char *p = patterns[i].pattern;
+        int plen = patterns[i].pattern_len;
+        
+        // Check for common patterns
+        if (strstr(p, "\\p{L}")) {
+            // Match Unicode letter
+            size_t len;
+            uint32_t cp = unicode_cpt_from_utf8(text, &len);
+            if (unicode_is_letter(cp)) return 1;
+        } else if (strstr(p, "\\p{N}")) {
+            // Match Unicode number
+            size_t len;
+            uint32_t cp = unicode_cpt_from_utf8(text, &len);
+            if (unicode_is_number(cp)) return 1;
+        } else if (p[0] == '\\' && p[1] == 's') {
+            // Match whitespace
+            if (isspace(text[0])) return 1;
+        } else if (p[0] == '\\' && p[1] == 'r') {
+            if (text[0] == '\r') return 1;
+        } else if (p[0] == '\\' && p[1] == 'n') {
+            if (text[0] == '\n') return 1;
+        } else if (p[0] == '.' && p[1] == '*') {
+            // Match anything
+            return 1;
+        } else if (isalnum(p[0]) || ispunct(p[0])) {
+            // Match literal character
+            if (text[0] == p[0]) return 1;
+        }
+    }
+    return 0;
+}
+
+static char** unicode_regex_split(const char *text, const RegexPattern *patterns, int num_patterns, int *num_words) {
+    char **words = NULL;
+    int word_count = 0;
+    int word_capacity = 0;
+    
+    size_t text_len = strlen(text);
+    size_t pos = 0;
+    
+    while (pos < text_len) {
+        // Find the start of a word (character that matches any regex)
+        size_t start = pos;
+        while (start < text_len) {
+            if (match_regex(text + start, patterns, num_patterns)) {
+                break;
+            }
+            start++;
+        }
+        
+        if (start >= text_len) break;
+        
+        // Find the end of the word (character that doesn't match any regex)
+        size_t end = start;
+        while (end < text_len) {
+            if (!match_regex(text + end, patterns, num_patterns)) {
+                break;
+            }
+            end++;
+        }
+        
+        if (end > start) {
+            // Extract the word
+            size_t word_len = end - start;
+            char *word = malloc(word_len + 1);
+            if (word) {
+                memcpy(word, text + start, word_len);
+                word[word_len] = '\0';
+                
+                // Add to array
+                if (word_count >= word_capacity) {
+                    word_capacity = word_capacity == 0 ? 16 : word_capacity * 2;
+                    words = realloc(words, word_capacity * sizeof(char*));
+                    if (!words) {
+                        for (int i = 0; i < word_count; i++) free(words[i]);
+                        free(words);
+                        *num_words = 0;
+                        return NULL;
+                    }
+                }
+                words[word_count++] = word;
+            }
+        }
+        
+        pos = end;
+    }
+    
+    *num_words = word_count;
+    return words;
+}
+
+/* ------------------------------------------------------------------------- */
+// BPE merge structure
+typedef struct {
+    char *left;
+    char *right;
+    char *merged;
+    int rank;
+} BPEMerge;
+
+typedef struct {
+    BPEMerge *merges;
+    int num_merges;
+    int capacity;
+} BPEMergeTable;
+
+static void bpe_merge_table_init(BPEMergeTable *table) {
+    table->merges = NULL;
+    table->num_merges = 0;
+    table->capacity = 0;
+}
+
+static void bpe_merge_table_add(BPEMergeTable *table, const char *left, const char *right, const char *merged, int rank) {
+    if (table->num_merges >= table->capacity) {
+        table->capacity = table->capacity == 0 ? 100 : table->capacity * 2;
+        table->merges = realloc(table->merges, table->capacity * sizeof(BPEMerge));
+    }
+    
+    BPEMerge *merge = &table->merges[table->num_merges++];
+    merge->left = strdup(left);
+    merge->right = strdup(right);
+    merge->merged = strdup(merged);
+    merge->rank = rank;
+}
+
+static void bpe_merge_table_free(BPEMergeTable *table) {
+    for (int i = 0; i < table->num_merges; i++) {
+        free(table->merges[i].left);
+        free(table->merges[i].right);
+        free(table->merges[i].merged);
+    }
+    free(table->merges);
+    table->merges = NULL;
+    table->num_merges = 0;
+}
+
+static int bpe_merge_rank(const BPEMergeTable *table, const char *left, const char *right) {
+    for (int i = 0; i < table->num_merges; i++) {
+        if (strcmp(table->merges[i].left, left) == 0 && strcmp(table->merges[i].right, right) == 0) {
+            return table->merges[i].rank;
+        }
+    }
+    return -1;
+}
+
+static char* bpe_merge(const BPEMergeTable *table, const char *left, const char *right) {
+    for (int i = 0; i < table->num_merges; i++) {
+        if (strcmp(table->merges[i].left, left) == 0 && strcmp(table->merges[i].right, right) == 0) {
+            return table->merges[i].merged;
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------------- */
+// BPE tokenization helper structures
+typedef struct {
+    char *text;
+    int start;
+    int end;
+    int prev;
+    int next;
+    int used;
+} BPESymbol;
+
+static void bpe_tokenize_word(const BPEMergeTable *merges, const char *word, int (*text_to_id)(void*, const char*), void *vocab_data, int *token_ids, int *num_tokens) {
+    // Initialize symbols from characters
+    int word_len = strlen(word);
+    int num_symbols = 0;
+    BPESymbol *symbols = malloc(word_len * sizeof(BPESymbol));
+    
+    // Split into UTF-8 characters
+    int offset = 0;
+    while (offset < word_len) {
+        int char_len = unicode_len_utf8(word[offset]);
+        symbols[num_symbols].text = (char*)word + offset;
+        symbols[num_symbols].start = offset;
+        symbols[num_symbols].end = offset + char_len;
+        symbols[num_symbols].prev = num_symbols - 1;
+        symbols[num_symbols].next = num_symbols + 1;
+        symbols[num_symbols].used = 1;
+        offset += char_len;
+        num_symbols++;
+    }
+    
+    if (num_symbols <= 1) {
+        // Single character, just tokenize it
+        int id = text_to_id(vocab_data, word);
+        if (id != -1) {
+            token_ids[*num_tokens] = id;
+            (*num_tokens)++;
+        }
+        free(symbols);
+        return;
+    }
+    
+    // Build priority queue for merges (simplified)
+    typedef struct {
+        int left;
+        int right;
+        int rank;
+    } Bigram;
+    
+    Bigram *bigrams = malloc(word_len * word_len * sizeof(Bigram));
+    int num_bigrams = 0;
+    
+    // Initialize bigrams
+    for (int i = 0; i < num_symbols - 1; i++) {
+        if (symbols[i].used && symbols[i+1].used) {
+            // Get the concatenated string for this pair
+            char *left_str = malloc(symbols[i].end - symbols[i].start + 1);
+            char *right_str = malloc(symbols[i+1].end - symbols[i+1].start + 1);
+            memcpy(left_str, symbols[i].text, symbols[i].end - symbols[i].start);
+            memcpy(right_str, symbols[i+1].text, symbols[i+1].end - symbols[i+1].start);
+            left_str[symbols[i].end - symbols[i].start] = '\0';
+            right_str[symbols[i+1].end - symbols[i+1].start] = '\0';
+            
+            int rank = bpe_merge_rank(merges, left_str, right_str);
+            if (rank != -1) {
+                bigrams[num_bigrams].left = i;
+                bigrams[num_bigrams].right = i+1;
+                bigrams[num_bigrams].rank = rank;
+                num_bigrams++;
+            }
+            
+            free(left_str);
+            free(right_str);
+        }
+    }
+    
+    // Sort bigrams by rank (lower rank = higher priority)
+    for (int i = 0; i < num_bigrams - 1; i++) {
+        for (int j = i+1; j < num_bigrams; j++) {
+            if (bigrams[i].rank > bigrams[j].rank) {
+                Bigram temp = bigrams[i];
+                bigrams[i] = bigrams[j];
+                bigrams[j] = temp;
+            }
+        }
+    }
+    
+    // Apply merges
+    int *merged = calloc(num_symbols, sizeof(int));
+    for (int i = 0; i < num_bigrams; i++) {
+        int left = bigrams[i].left;
+        int right = bigrams[i].right;
+        
+        if (merged[left] || merged[right]) continue;
+        
+        // Merge right into left
+        symbols[left].end = symbols[right].end;
+        symbols[left].next = symbols[right].next;
+        merged[right] = 1;
+        
+        // Update next symbol's prev
+        if (symbols[right].next < num_symbols) {
+            symbols[symbols[right].next].prev = left;
+        }
+    }
+    
+    // Collect final tokens
+    for (int i = 0; i < num_symbols; i++) {
+        if (!merged[i] && symbols[i].used) {
+            // Extract the substring
+            char *substr = malloc(symbols[i].end - symbols[i].start + 1);
+            memcpy(substr, word + symbols[i].start, symbols[i].end - symbols[i].start);
+            substr[symbols[i].end - symbols[i].start] = '\0';
+            
+            int id = text_to_id(vocab_data, substr);
+            if (id != -1) {
+                token_ids[*num_tokens] = id;
+                (*num_tokens)++;
+            } else {
+                // Unknown token - use byte-level fallback
+                // For simplicity, we'll use space as a placeholder
+                // In a full implementation, you'd encode bytes individually
+            }
+            
+            free(substr);
+        }
+    }
+    
+    free(bigrams);
+    free(merged);
+    free(symbols);
+}
 
 /* ------------------------------------------------------------------------- */
 static int safe_advance(uint8_t **p, uint8_t *end, size_t sz) {
@@ -91,6 +457,15 @@ typedef struct {
     void      *mapped;
     size_t     mapped_size;
     HashNode **table;
+    
+    // BPE tokenization data
+    BPEMergeTable merges;
+    RegexPattern *pre_patterns;
+    int num_pre_patterns;
+    int unknown_token_id;
+    int bos_token_id;
+    int eos_token_id;
+    int vocab_type;
 } EmbedModel;
 
 typedef struct {
@@ -120,6 +495,11 @@ static int hget(EmbedModel *m, const char *k) {
         n = n->next;
     }
     return -1;
+}
+
+static int text_to_id(void *vocab_data, const char *text) {
+    EmbedModel *m = (EmbedModel*)vocab_data;
+    return hget(m, text);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -457,6 +837,16 @@ static void free_model_contents(EmbedModel *m) {
     }
     if (m->float_data) free(m->float_data);
     if (m->mapped) munmap(m->mapped, m->mapped_size);
+    
+    // Free BPE tokenization data
+    bpe_merge_table_free(&m->merges);
+    if (m->pre_patterns) {
+        for (int i = 0; i < m->num_pre_patterns; i++) {
+            free(m->pre_patterns[i].pattern);
+        }
+        free(m->pre_patterns);
+    }
+    
     free(m);
 }
 
@@ -484,6 +874,46 @@ static uint8_t *find_tensor_info_start(uint8_t *cur, uint8_t *end) {
 }
 
 /* ------------------------------------------------------------------------- */
+static void setup_default_pre_patterns(EmbedModel *m) {
+    // Default pre-tokenization regex patterns (similar to Llama 3)
+    const char *default_patterns[] = {
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
+        "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+",
+        "\\p{N}{1,3}",
+        " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
+        "\\s*[\\r\\n]+",
+        "\\s+(?!\\S)",
+        "\\s+"
+    };
+    
+    m->num_pre_patterns = sizeof(default_patterns) / sizeof(default_patterns[0]);
+    m->pre_patterns = malloc(m->num_pre_patterns * sizeof(RegexPattern));
+    
+    for (int i = 0; i < m->num_pre_patterns; i++) {
+        m->pre_patterns[i].pattern = strdup(default_patterns[i]);
+        m->pre_patterns[i].pattern_len = strlen(default_patterns[i]);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+static void parse_merge(const char *merge_str, char **left, char **right) {
+    // Parse a merge string like "h ello" -> left="h", right="ello"
+    const char *space = strchr(merge_str, ' ');
+    if (space) {
+        int left_len = space - merge_str;
+        *left = malloc(left_len + 1);
+        memcpy(*left, merge_str, left_len);
+        (*left)[left_len] = '\0';
+        
+        *right = strdup(space + 1);
+    } else {
+        // No space - treat as single token
+        *left = strdup(merge_str);
+        *right = strdup("");
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 static EmbedModel *embed_load_gguf(const char *path) {
     size_t sz;
     uint8_t *base = map_file(path, &sz);
@@ -504,6 +934,16 @@ static EmbedModel *embed_load_gguf(const char *path) {
     m->mapped_size = sz;
     m->table = calloc(HASH_SIZE, sizeof(HashNode*));
     if (!m->table) { free_model_contents(m); return NULL; }
+    
+    // Initialize BPE structures
+    bpe_merge_table_init(&m->merges);
+    setup_default_pre_patterns(m);
+    
+    // Default values
+    m->unknown_token_id = -1;
+    m->bos_token_id = -1;
+    m->eos_token_id = -1;
+    m->vocab_type = LLAMA_VOCAB_TYPE_NONE;
 
     /* ---------- Metadata ---------- */
     int vocab_found = 0;
@@ -527,6 +967,50 @@ static EmbedModel *embed_load_gguf(const char *path) {
                 hset(m, tok, (int)j);
             }
             vocab_found = 1;
+        } else if (strcmp(key, "tokenizer.ggml.merges") == 0 && type == 9) {
+            uint32_t subtype = rd32(&cur, end);
+            uint64_t n = rd64(&cur, end);
+            if (subtype == 8) {
+                // Parse merges
+                for (uint64_t j = 0; j < n && j < MAX_MERGES; j++) {
+                    char *merge_str = rdstr(&cur, end);
+                    if (merge_str) {
+                        char *left, *right;
+                        parse_merge(merge_str, &left, &right);
+                        bpe_merge_table_add(&m->merges, left, right, merge_str, j);
+                        free(left);
+                        free(right);
+                        free(merge_str);
+                    }
+                }
+            } else {
+                // Skip if not string array
+                if (!skip_value(&cur, end, type)) {
+                    free(key); free_model_contents(m); return NULL;
+                }
+            }
+        } else if (strcmp(key, "tokenizer.ggml.model") == 0 && type == 8) {
+            char *model_type = rdstr(&cur, end);
+            if (model_type) {
+                if (strcmp(model_type, "gpt2") == 0 || strcmp(model_type, "llama") == 0) {
+                    m->vocab_type = LLAMA_VOCAB_TYPE_BPE;
+                } else if (strcmp(model_type, "bert") == 0) {
+                    m->vocab_type = LLAMA_VOCAB_TYPE_WPM;
+                }
+                free(model_type);
+            }
+        } else if (strcmp(key, "tokenizer.ggml.pre") == 0 && type == 8) {
+            char *pre_type = rdstr(&cur, end);
+            if (pre_type) {
+                // Could load custom regex patterns here if needed
+                free(pre_type);
+            }
+        } else if (strcmp(key, "tokenizer.ggml.unknown_token_id") == 0 && type == 6) {
+            m->unknown_token_id = rd32(&cur, end);
+        } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0 && type == 6) {
+            m->bos_token_id = rd32(&cur, end);
+        } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0 && type == 6) {
+            m->eos_token_id = rd32(&cur, end);
         } else {
             if (!skip_value(&cur, end, type)) {
                 free(key); free_model_contents(m); return NULL;
@@ -625,28 +1109,71 @@ static EmbedModel *embed_load_gguf(const char *path) {
 /* ------------------------------------------------------------------------- */
 static void embed_text(EmbedModel *m, const char *txt, float *out) {
     memset(out, 0, sizeof(float) * m->dim);
-    char *copy = strdup(txt);
-    if (!copy) return;
-
-    char *tok = strtok(copy, " ");
-    int used = 0;
-    const float *embd_matrix = m->tensor_data;
-
-    while (tok) {
-        int id = hget(m, tok);
-        if (id >= 0 && id < m->vocab_size) {
-            const float *vec = embd_matrix + id * m->dim;
-            for (int i = 0; i < m->dim; i++) out[i] += vec[i];
-            used++;
+    
+    // Pre-tokenize using regex
+    int num_words = 0;
+    char **words = unicode_regex_split(txt, m->pre_patterns, m->num_pre_patterns, &num_words);
+    
+    if (!words || num_words == 0) {
+        // Fallback to space splitting if regex fails
+        char *copy = strdup(txt);
+        if (!copy) return;
+        
+        char *tok = strtok(copy, " \t\n\r");
+        int used = 0;
+        const float *embd_matrix = m->tensor_data;
+        
+        while (tok) {
+            int id = hget(m, tok);
+            if (id >= 0 && id < m->vocab_size) {
+                const float *vec = embd_matrix + id * m->dim;
+                for (int i = 0; i < m->dim; i++) out[i] += vec[i];
+                used++;
+            }
+            tok = strtok(NULL, " \t\n\r");
         }
-        tok = strtok(NULL, " ");
+        
+        if (used > 0) {
+            float inv = 1.0f / used;
+            for (int i = 0; i < m->dim; i++) out[i] *= inv;
+        }
+        free(copy);
+        return;
     }
-
+    
+    // Tokenize each word using BPE
+    int *token_ids = malloc(m->vocab_size * sizeof(int)); // Max possible tokens
+    int num_tokens = 0;
+    const float *embd_matrix = m->tensor_data;
+    int used = 0;
+    
+    for (int i = 0; i < num_words; i++) {
+        num_tokens = 0;
+        bpe_tokenize_word(&m->merges, words[i], text_to_id, m, token_ids, &num_tokens);
+        
+        for (int j = 0; j < num_tokens; j++) {
+            int id = token_ids[j];
+            if (id >= 0 && id < m->vocab_size) {
+                const float *vec = embd_matrix + id * m->dim;
+                for (int k = 0; k < m->dim; k++) out[k] += vec[k];
+                used++;
+            } else if (m->unknown_token_id != -1 && m->unknown_token_id < m->vocab_size) {
+                // Use unknown token as fallback
+                const float *vec = embd_matrix + m->unknown_token_id * m->dim;
+                for (int k = 0; k < m->dim; k++) out[k] += vec[k];
+                used++;
+            }
+        }
+        
+        free(words[i]);
+    }
+    free(words);
+    free(token_ids);
+    
     if (used > 0) {
         float inv = 1.0f / used;
         for (int i = 0; i < m->dim; i++) out[i] *= inv;
     }
-    free(copy);
 }
 
 /* ------------------------------------------------------------------------- */
