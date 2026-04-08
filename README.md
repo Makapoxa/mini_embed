@@ -52,14 +52,18 @@ require 'mini_embed'
 # Load a GGUF model (F32, F16, Q8_0, Q4_K, etc. are all supported)
 model = MiniEmbed.new(model: '/path/to/gte-small.Q8_0.gguf')
 
-# Get the raw binary string (little‑endian 32‑bit floats)
-binary = model.embeddings(text: 'hello world')
-
-# Get an embedding as an array of floats
-embedding = binary.unpack('e*')
+# Get embedding as an array of floats (default)
+embedding = model.embeddings(text: 'hello world')
 puts embedding.size   # e.g. 384
 puts embedding[0..4]  # e.g. [0.0123, -0.0456, ...]
+
+# Or get the raw binary string (little‑endian 32‑bit floats)
+binary = model.embeddings(text: 'hello world', type: :binary)
+embedding_from_binary = binary.unpack('e*')
 ```
+
+Note: The type parameter is optional – it defaults to :vector which returns a Ruby `Array<Float>`. Use `type: :binary` to get the raw binary string (compatible with the original C extension).
+
 
 ## Simple tokenization note
 MiniEmbed uses a naive space‑based tokenizer. This means it splits input on spaces and looks up each token exactly in the model's vocabulary. For models trained with subword tokenization (like BERT), this will not work for out‑of‑vocabulary words.
