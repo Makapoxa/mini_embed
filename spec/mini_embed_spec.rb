@@ -33,7 +33,7 @@ RSpec.describe MiniEmbed do
         result = model.embeddings(text: 'hello world')
         expect(result.size).to be > 0
         # All entries should be finite numbers (not NaN or Infinity)
-        expect(result.all? { |v| v.finite? }).to be true
+        expect(result.all?(&:finite?)).to be true
       end
 
       it 'returns different embeddings for different inputs' do
@@ -58,7 +58,7 @@ RSpec.describe MiniEmbed do
         # If all tokens unknown, result may be zero; but we just check no crash
         result = model.embeddings(text: 'xyznonexistenttoken123')
         expect(result).to be_a(Array)
-        expect(result.all? { |v| v.finite? }).to be true
+        expect(result.all?(&:finite?)).to be true
       end
     end
 

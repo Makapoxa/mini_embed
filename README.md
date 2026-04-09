@@ -6,6 +6,8 @@ A minimal, dependency‑free C extension for Ruby that loads [GGUF](https://gith
 
 ---
 
+[![CircleCI](https://dl.circleci.com/status-badge/img/gh/Makapoxa/mini_embed/tree/main.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/Makapoxa/mini_embed/tree/main)
+
 ## Why MiniEmbed?
 
 - **Zero external dependencies** – no TensorFlow, PyTorch, or ONNX runtime.
