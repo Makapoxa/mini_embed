@@ -10,13 +10,6 @@ RSpec.describe MiniEmbed do
       expect { described_class.new(model: correct_gguf_path) }.not_to raise_error
     end
 
-    it 'raises an error for an invalid file path' do
-      non_existent_file_path = 'spec/fixtures/non-gguf.file.gguf'
-      expect { described_class.new(model: non_existent_file_path) }.to(
-        raise_error(RuntimeError, /failed to load GGUF model/)
-      )
-    end
-
     it 'raises an error for a non-GGUF file' do
       incorrect_file_path = 'spec/fixtures/non-gguf.file.gguf'
       expect { described_class.new(model: incorrect_file_path) }.to(
