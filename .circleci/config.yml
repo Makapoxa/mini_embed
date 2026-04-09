@@ -47,6 +47,9 @@ jobs:
             - ./vendor/bundle
           key: v1-dependencies-{{ checksum "Gemfile.lock" }}
       - run:
+          name: Compile native extension
+          command: bundle exec rake compile
+      - run:
           name: Run RSpec
           command: bundle exec rspec
 
