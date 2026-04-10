@@ -1,12 +1,12 @@
 # mini_embed
 
+[![CircleCI](https://dl.circleci.com/status-badge/img/gh/Makapoxa/mini_embed/tree/main.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/Makapoxa/mini_embed/tree/main) [![Gem Version](https://badge.fury.io/rb/mini_embed.svg)](https://badge.fury.io/rb/mini_embed)
+
 A minimal, dependency‑free C extension for Ruby that loads [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) embedding models and computes text embeddings **locally**.
 
 **⚠️ Important:** This gem is intended for **small projects, prototypes, and hobbyist use**. It allows you to experiment with embeddings without relying on external APIs or cloud costs. **Do not use MiniEmbed in production** – it lacks the performance, scalability, and tokenization robustness of dedicated solutions. For real applications, use a proper inference server like [llama.cpp](https://github.com/ggerganov/llama.cpp) with its HTTP API, or managed services such as OpenAI, Cohere, or Hugging Face.
 
 ---
-
-[![CircleCI](https://dl.circleci.com/status-badge/img/gh/Makapoxa/mini_embed/tree/main.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/Makapoxa/mini_embed/tree/main)
 
 ## Why MiniEmbed?
 
