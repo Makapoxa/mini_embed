@@ -637,10 +637,13 @@ static void dequantize_row_q5_0(const void *vx, float *y, int k) {
         uint32_t qh32;
         memcpy(&qh32, block + 2, 4);
         const uint8_t *ql = block + 6;
-        for (int j = 0; j < 32; j++) {
-            const uint8_t vh = (qh32 >> j) & 1;
-            const int v = ((ql[j/2] >> (4*(j%2))) & 0x0F) | (vh << 4);
-            y[i*32 + j] = (v - 16.0f) * d;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t xh0 = ((qh32 >> (j + 0)) << 4) & 0x10;
+            const uint8_t xh1 = ((qh32 >> (j + 12))) & 0x10;
+            const int x0 = ((ql[j] & 0x0F) | xh0) - 16;
+            const int x1 = ((ql[j] >> 4) | xh1) - 16;
+            y[i*32 + j] = x0 * d;
+            y[i*32 + j + 16] = x1 * d;
         }
     }
 }
@@ -658,10 +661,13 @@ static void dequantize_row_q5_1(const void *vx, float *y, int k) {
         uint32_t qh32;
         memcpy(&qh32, block + 4, 4);
         const uint8_t *ql = block + 8;
-        for (int j = 0; j < 32; j++) {
-            const uint8_t vh = (qh32 >> j) & 1;
-            const int v = ((ql[j/2] >> (4*(j%2))) & 0x0F) | (vh << 4);
-            y[i*32 + j] = v * d + m;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t xh0 = ((qh32 >> (j + 0)) << 4) & 0x10;
+            const uint8_t xh1 = ((qh32 >> (j + 12))) & 0x10;
+            const int x0 = (ql[j] & 0x0F) | xh0;
+            const int x1 = (ql[j] >> 4) | xh1;
+            y[i*32 + j] = x0 * d + m;
+            y[i*32 + j + 16] = x1 * d + m;
         }
     }
 }
@@ -690,10 +696,10 @@ static void dequantize_row_q8_1(const void *vx, float *y, int k) {
         memcpy(&d16, block, 2);
         memcpy(&s16, block + 2, 2);
         const float d = fp16_to_fp32(d16);
-        const float s = fp16_to_fp32(s16);
+        (void)s16;
         const int8_t *q = (const int8_t*)(block + 4);
         for (int j = 0; j < 32; j++) {
-            y[i*32 + j] = (float)q[j] * d + s;
+            y[i*32 + j] = (float)q[j] * d;
         }
     }
 }
@@ -704,8 +710,8 @@ static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t
         *d = q[j] & 63;
         *m = q[j + 4] & 63;
     } else {
-        *d = (q[j+4] & 0xF) | ((q[j-3] >> 6) << 4);
-        *m = (q[j+4] >>  4) | ((q[j-1] >> 6) << 4);
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
     }
 }
 
@@ -715,19 +721,30 @@ static void dequantize_row_q2_K(const void *vx, float *y, int k) {
     for (int i = 0; i < nb; i++) {
         const uint8_t *block = x + i * 84;
         uint16_t d16, dmin16;
-        memcpy(&d16, block, 2);
-        memcpy(&dmin16, block + 2, 2);
+        memcpy(&d16, block + 80, 2);
+        memcpy(&dmin16, block + 82, 2);
         const float d = fp16_to_fp32(d16);
         const float min = fp16_to_fp32(dmin16);
-        const uint8_t *scales = block + 4;
-        const uint8_t *q = block + 20;
-        for (int j = 0; j < QK_K; j += 64) {
-            const float dl = d * (scales[j/64] & 0xF);
-            const float ml = min * (scales[j/64] >> 4);
-            for (int l = 0; l < 64; l++) {
-                const int v = (q[(j+l)/4] >> (2*((j+l)%4))) & 0x03;
-                y[i*QK_K + j + l] = v * dl + ml;
+        const uint8_t *scales = block;
+        const uint8_t *q = block + 16;
+        float *dst = y + (size_t)i * QK_K;
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = scales[is++];
+                float dl = d * (sc & 0x0F);
+                float ml = min * (sc >> 4);
+                for (int l = 0; l < 16; l++) *dst++ = dl * ((q[l] >> shift) & 3) - ml;
+
+                sc = scales[is++];
+                dl = d * (sc & 0x0F);
+                ml = min * (sc >> 4);
+                for (int l = 0; l < 16; l++) *dst++ = dl * ((q[l + 16] >> shift) & 3) - ml;
+
+                shift += 2;
             }
+            q += 32;
         }
     }
 }
@@ -735,30 +752,45 @@ static void dequantize_row_q2_K(const void *vx, float *y, int k) {
 static void dequantize_row_q3_K(const void *vx, float *y, int k) {
     const int nb = k / QK_K;
     const uint8_t *x = vx;
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    uint32_t aux[4];
+    const int8_t *scales = (const int8_t*)aux;
     for (int i = 0; i < nb; i++) {
         const uint8_t *block = x + i * 110;
         uint16_t d16;
-        memcpy(&d16, block, 2);
-        const float d = fp16_to_fp32(d16);
-        const uint8_t *hmask = block + 2;
-        const uint8_t *q = block + 34;
-        const uint8_t *scales = block + 98;
-        for (int j = 0; j < QK_K; j += 64) {
-            const uint8_t ls1 = scales[j/64] & 0x1F;
-            const uint8_t ls2 = (scales[j/64] >> 5) | ((scales[j/64 + 1] & 0x7) << 3);
-            const uint8_t ls3 = ((scales[j/64 + 1] >> 3) & 0x1F);
-            const uint8_t ls4 = (scales[j/64 + 1] >> 8);
-            for (int l = 0; l < 64; l++) {
-                int v = (q[(j+l)/2] >> (4*((j+l)%2))) & 0x0F;
-                const int bit = (hmask[(j+l)/8] >> ((j+l)%8)) & 1;
-                v |= bit << 4;
-                float ls;
-                if (l < 16) ls = ls1;
-                else if (l < 32) ls = ls2;
-                else if (l < 48) ls = ls3;
-                else ls = ls4;
-                y[i*QK_K + j + l] = (v - 32.0f) * d * ls;
+        memcpy(&d16, block + 108, 2);
+        const float d_all = fp16_to_fp32(d16);
+        const uint8_t *q = block + 32;
+        const uint8_t *hm = block;
+        uint8_t m = 1;
+        float *dst = y + (size_t)i * QK_K;
+
+        memcpy(aux, block + 96, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                float dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; l++) {
+                    *dst++ = dl * ((int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                }
+
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; l++) {
+                    *dst++ = dl * ((int)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                }
+
+                shift += 2;
+                m <<= 1;
             }
+            q += 32;
         }
     }
 }
@@ -810,6 +842,7 @@ static void dequantize_row_q5_K(const void *vx, float *y, int k) {
         const uint8_t *qh = block + 16;
         const uint8_t *ql = block + 48;
         int is = 0;
+        uint8_t u1 = 1, u2 = 2;
         for (int j = 0; j < QK_K; j += 64) {
             uint8_t sc, m;
             get_scale_min_k4(is, scales, &sc, &m);
@@ -819,17 +852,17 @@ static void dequantize_row_q5_K(const void *vx, float *y, int k) {
             float d2 = d * sc;
             float m2 = min * m;
             for (int l = 0; l < 32; l++) {
-                int vh = (qh[j/64 * 4 + l/8] >> (l%8)) & 1;
-                int v = (ql[l] & 0xF) | (vh << 4);
+                int v = (ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0);
                 y[i*QK_K + j + l] = d1 * v - m1;
             }
             for (int l = 0; l < 32; l++) {
-                int vh = (qh[j/64 * 4 + 4 + l/8] >> (l%8)) & 1;
-                int v = (ql[l] >> 4) | (vh << 4);
+                int v = (ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0);
                 y[i*QK_K + j + 32 + l] = d2 * v - m2;
             }
             ql += 32;
             is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 }
@@ -845,23 +878,23 @@ static void dequantize_row_q6_K(const void *vx, float *y, int k) {
         uint16_t d16;
         memcpy(&d16, block + 208, 2);
         const float d = fp16_to_fp32(d16);
+        float *dst = y + (size_t)i * QK_K;
         for (int j = 0; j < QK_K; j += 128) {
             for (int l = 0; l < 32; l++) {
-                int v = (ql[j/2 + l] & 0xF) | (((qh[j/4 + l/2] >> ((l%2)*4)) & 0xF) << 4);
-                y[i*QK_K + j + l] = v * d * scales[j/128 * 8 + l/4];
+                int is = l / 16;
+                int q1 = ((ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                dst[l] = d * scales[is + 0] * q1;
+                dst[l + 32] = d * scales[is + 2] * q2;
+                dst[l + 64] = d * scales[is + 4] * q3;
+                dst[l + 96] = d * scales[is + 6] * q4;
             }
-            for (int l = 0; l < 32; l++) {
-                int v = (ql[j/2 + 32 + l] >> 4) | (((qh[j/4 + 16 + l/2] >> ((l%2)*4)) & 0xF) << 4);
-                y[i*QK_K + j + 32 + l] = v * d * scales[j/128 * 8 + 8 + l/4];
-            }
-            for (int l = 0; l < 32; l++) {
-                int v = (ql[j/2 + 64 + l] & 0xF) | (((qh[j/4 + 32 + l/2] >> ((l%2)*4)) & 0xF) << 4);
-                y[i*QK_K + j + 64 + l] = v * d * scales[j/128 * 8 + 4 + l/4];
-            }
-            for (int l = 0; l < 32; l++) {
-                int v = (ql[j/2 + 96 + l] >> 4) | (((qh[j/4 + 48 + l/2] >> ((l%2)*4)) & 0xF) << 4);
-                y[i*QK_K + j + 96 + l] = v * d * scales[j/128 * 8 + 12 + l/4];
-            }
+            dst += 128;
+            ql += 64;
+            qh += 32;
+            scales += 8;
         }
     }
 }
@@ -904,7 +937,7 @@ static void dequantize_row_lazy(const EmbedModel *m, int row, float *out) {
                     case GGML_TYPE_Q5_0: rb = (nc / 32) * 22; break;
                     case GGML_TYPE_Q5_1: rb = (nc / 32) * 24; break;
                     case GGML_TYPE_Q8_0: rb = (nc / 32) * 34; break;
-                    case GGML_TYPE_Q8_1: rb = (nc / 32) * 40; break;
+                    case GGML_TYPE_Q8_1: rb = (nc / 32) * 36; break;
                     case GGML_TYPE_Q2_K: rb = (nc / 256) * 84; break;
                     case GGML_TYPE_Q3_K: rb = (nc / 256) * 110; break;
                     case GGML_TYPE_Q4_K: rb = (nc / 256) * 144; break;
@@ -972,6 +1005,30 @@ static void dequantize_row_lazy(const EmbedModel *m, int row, float *out) {
         if (isnan(out[j]) || isinf(out[j]) || fabsf(out[j]) > 1e10f) {
             out[j] = 0.0f;
         }
+    }
+}
+
+static int tensor_type_block_size(int type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+            return 1;
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
+            return QK8_0;
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_K:
+            return QK_K;
+        default:
+            return 0;
     }
 }
 
@@ -1261,6 +1318,11 @@ static EmbedModel *embed_load_gguf(const char *path) {
         for (uint32_t d = 0; d < t->n_dims; d++) t->dims[d] = rd64(&cur, end);
         t->type = (int)rd32(&cur, end);
         uint64_t offset = rd64(&cur, end);
+        int block_size = tensor_type_block_size(t->type);
+        if (block_size == 0 || t->dims[0] % (uint64_t)block_size != 0) {
+            free_model_contents(m);
+            return NULL;
+        }
         t->row_bytes = get_row_bytes(t->type, (int)t->dims[0]);
         if (t->row_bytes == 0) { free_model_contents(m); return NULL; }
         t->data = (const uint8_t*)(uintptr_t)offset;
@@ -1343,8 +1405,38 @@ static void tensor_get_row(const Tensor *t, int row, float *out) {
         case GGML_TYPE_Q4_0:
             dequantize_row_q4_0(raw, out, cols);
             break;
+        case GGML_TYPE_Q4_1:
+            dequantize_row_q4_1(raw, out, cols);
+            break;
+        case GGML_TYPE_Q5_0:
+            dequantize_row_q5_0(raw, out, cols);
+            break;
+        case GGML_TYPE_Q5_1:
+            dequantize_row_q5_1(raw, out, cols);
+            break;
         case GGML_TYPE_Q8_0:
             dequantize_row_q8_0(raw, out, cols);
+            break;
+        case GGML_TYPE_Q8_1:
+            dequantize_row_q8_1(raw, out, cols);
+            break;
+        case GGML_TYPE_Q2_K:
+            dequantize_row_q2_K(raw, out, cols);
+            break;
+        case GGML_TYPE_Q3_K:
+            dequantize_row_q3_K(raw, out, cols);
+            break;
+        case GGML_TYPE_Q4_K:
+            dequantize_row_q4_K(raw, out, cols);
+            break;
+        case GGML_TYPE_Q5_K:
+            dequantize_row_q5_K(raw, out, cols);
+            break;
+        case GGML_TYPE_Q6_K:
+            dequantize_row_q6_K(raw, out, cols);
+            break;
+        case GGML_TYPE_Q8_K:
+            dequantize_row_q8_K(raw, out, cols);
             break;
         default:
             memset(out, 0, (size_t)cols * sizeof(float));

@@ -11,8 +11,9 @@ A minimal, dependency‑free C extension for Ruby that loads [GGUF](https://gith
 ## Why MiniEmbed?
 
 - **Zero external dependencies** – no TensorFlow, PyTorch, or ONNX runtime.
-- **Single‑file C extension** – fast loading and mean‑pooled embeddings.
-- **Supports all common GGUF quantizations** – from `F32` to `Q2_K`.
+- **Single‑file C extension** – fast loading and local sentence embeddings.
+- **Runs BERT/GTE embedding models end to end** – token embeddings, transformer layers, mean pooling, and L2 normalization.
+- **Supports the GGML tensor types declared by this extension** – `F32`, `F16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`, and K-quants through `Q8_K`.
 - **Works entirely offline** – your data never leaves your machine.
 - Perfect for **weekend projects**, **proof‑of‑concepts**, or **learning** about embeddings.
 
@@ -51,8 +52,8 @@ A GGUF embedding model file (see Where to get models).
 ```ruby
 require 'mini_embed'
 
-# Load a GGUF model (F32, F16, Q8_0, Q4_K, etc. are all supported)
-model = MiniEmbed.new(model: '/path/to/gte-small.Q8_0.gguf')
+# Load a GGUF embedding model
+model = MiniEmbed.new(model: '/path/to/gte-small.Q4_0.gguf')
 
 # Get embedding as an array of floats (default)
 embedding = model.embeddings(text: 'hello world')
@@ -66,13 +67,23 @@ embedding_from_binary = binary.unpack('e*')
 
 Note: The type parameter is optional – it defaults to :vector which returns a Ruby `Array<Float>`. Use `type: :binary` to get the raw binary string (compatible with the original C extension).
 
+You can also request L2 normalization for the fallback token-averaging path:
 
-## Simple tokenization note
-MiniEmbed uses a naive space‑based tokenizer. This means it splits input on spaces and looks up each token exactly in the model's vocabulary. For models trained with subword tokenization (like BERT), this will not work for out‑of‑vocabulary words.
-If you need proper subword tokenization, you can:
+```ruby
+model = MiniEmbed.new(model: '/path/to/model.gguf', normalize: :l2)
+```
+
+For supported BERT/GTE GGUF models, MiniEmbed already returns L2-normalized sentence embeddings to match llama.cpp embedding output.
+
+## Tokenization And Model Support
+For BERT/GTE-style GGUF embedding models, MiniEmbed uses the model's WordPiece vocabulary, adds CLS/SEP tokens, runs the transformer stack, mean-pools the sequence output, and L2-normalizes the result.
+
+For non-BERT GGUF models, MiniEmbed falls back to pre-tokenization plus vocabulary/BPE lookup and averages token embedding rows. That fallback is useful for simple experiments, but it is not equivalent to running a full transformer model.
+
+If you need a model/tokenizer family that is not covered by the current C path, you can:
 
 - Pre‑tokenize in Ruby using the tokenizers gem and pass token IDs (not yet exposed in the C API, but easy to add).
-- Stick to simple vocabulary words that exist in the model (e.g., "text", "hello", "dog").
+- Run llama.cpp as a server and call its embeddings endpoint.
 
 ## Supported Quantization Types
 
@@ -93,9 +104,11 @@ If you need proper subword tokenization, you can:
 | 14   | Q6_K          |
 | 15   | Q8_K          |
 
-The extension automatically dequantizes the embedding matrix on load, so inference speed is always that of a plain float32 lookup.
+The extension validates tensor row alignment while loading the GGUF file and dequantizes rows as they are used. `Q4_0` linear layers have a ggml-like optimized dot path; other quantized linear layers use correctly dequantized float rows.
 
-Where to get models
+MiniEmbed supports the tensor types listed above. It does not currently implement newer llama.cpp formats that are not declared in this extension, such as IQ, MXFP, or NVFP variants.
+
+## Where to get models
 Hugging Face offers many GGUF models, e.g.:
 
 - `gte-small`
@@ -109,8 +122,8 @@ For testing, we recommend the `gte-small` model (384 dimensions, ~30k vocabulary
 
 - Single‑threaded, blocking C code – embedding computation runs on the Ruby thread, freezing the interpreter.
 - No batching – only one text at a time.
-- Space‑based tokenization only – works only for words present exactly in the vocabulary.
-- Loads the entire embedding matrix into RAM – for large vocabularies this may consume significant memory.
+- BERT/GTE support is intentionally narrow and only covers the tensor/tokenizer shapes implemented in the C extension.
+- Model files are memory-mapped and tensor rows are dequantized on demand, but large GGUF files still consume address space and memory bandwidth.
 - No GPU support – CPU only.
 - Error handling is minimal – invalid models may crash the Ruby process.
 
